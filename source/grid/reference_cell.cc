@@ -13,7 +13,9 @@
 //
 // ---------------------------------------------------------------------
 
+#include <deal.II/base/polynomial.h>
 #include <deal.II/base/quadrature_lib.h>
+#include <deal.II/base/tensor_product_polynomials.h>
 
 #include <deal.II/fe/mapping_fe.h>
 #include <deal.II/fe/mapping_q1.h>
@@ -23,6 +25,7 @@
 #include <deal.II/grid/tria.h>
 
 #include <deal.II/simplex/fe_lib.h>
+#include <deal.II/simplex/polynomials.h>
 #include <deal.II/simplex/quadrature_lib.h>
 
 DEAL_II_NAMESPACE_OPEN
@@ -102,6 +105,7 @@ namespace ReferenceCell
   }
 
 
+
   template <int dim, int spacedim>
   const Mapping<dim, spacedim> &
   get_default_linear_mapping(const Type &reference_cell)
@@ -179,6 +183,47 @@ namespace ReferenceCell
       Assert(false, ExcNotImplemented());
 
     return Quadrature<dim>(); // never reached
+  }
+
+  template <int dim>
+  Quadrature<dim> &
+  get_nodal_type_quadrature(const Type &reference_cell)
+  {
+    AssertDimension(dim, get_dimension(reference_cell));
+
+    const auto create_quadrature = [](const Type &reference_cell) {
+      Triangulation<dim> tria;
+      make_triangulation(reference_cell, tria);
+
+      return Quadrature<dim>(tria.get_vertices());
+    };
+
+    if (reference_cell == get_hypercube(dim))
+      {
+        static Quadrature<dim> quadrature = create_quadrature(reference_cell);
+        return quadrature;
+      }
+    else if (reference_cell == Type::Tri || reference_cell == Type::Tet)
+      {
+        static Quadrature<dim> quadrature = create_quadrature(reference_cell);
+        return quadrature;
+      }
+    else if (reference_cell == Type::Pyramid)
+      {
+        static Quadrature<dim> quadrature = create_quadrature(reference_cell);
+        return quadrature;
+      }
+    else if (reference_cell == Type::Wedge)
+      {
+        static Quadrature<dim> quadrature = create_quadrature(reference_cell);
+        return quadrature;
+      }
+    else
+      Assert(false, ExcNotImplemented());
+
+    static Quadrature<dim> dummy;
+
+    return dummy; // never reached
   }
 
 #include "reference_cell.inst"

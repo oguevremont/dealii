@@ -175,6 +175,7 @@ MappingFE<dim, spacedim>::InternalData::initialize_face(
 }
 
 
+
 template <int dim, int spacedim>
 void
 MappingFE<dim, spacedim>::InternalData::compute_shape_function_values(
@@ -852,8 +853,27 @@ MappingFE<dim, spacedim>::MappingFE(const FiniteElement<dim, spacedim> &fe)
   Assert(polynomial_degree >= 1,
          ExcMessage("It only makes sense to create polynomial mappings "
                     "with a polynomial degree greater or equal to one."));
-  Assert(fe.tensor_degree() == 1, ExcNotImplemented());
   Assert(fe.n_components() == 1, ExcNotImplemented());
+
+  Assert(fe.has_support_points(), ExcNotImplemented());
+
+  const auto &mapping_support_points = fe.get_unit_support_points();
+
+  const auto reference_cell_type = fe.reference_cell_type();
+
+  const unsigned int n_points = mapping_support_points.size();
+  const unsigned int n_shape_functions =
+    ReferenceCell::internal::Info::get_cell(reference_cell_type).n_vertices();
+
+  this->mapping_support_point_weights =
+    Table<2, double>(n_points, n_shape_functions);
+
+  for (unsigned int point = 0; point < n_points; ++point)
+    for (unsigned int i = 0; i < n_shape_functions; ++i)
+      mapping_support_point_weights(point, i) =
+        ReferenceCell::d_linear_shape_function(reference_cell_type,
+                                               mapping_support_points[point],
+                                               i);
 }
 
 
@@ -862,6 +882,7 @@ template <int dim, int spacedim>
 MappingFE<dim, spacedim>::MappingFE(const MappingFE<dim, spacedim> &mapping)
   : fe(mapping.fe->clone())
   , polynomial_degree(mapping.polynomial_degree)
+  , mapping_support_point_weights(mapping.mapping_support_point_weights)
 {}
 
 
@@ -909,12 +930,77 @@ MappingFE<dim, spacedim>::transform_real_to_unit_cell(
   const typename Triangulation<dim, spacedim>::cell_iterator &cell,
   const Point<spacedim> &                                     p) const
 {
-  Assert(false, StandardExceptions::ExcNotImplemented());
+  const std::vector<Point<spacedim>> support_points =
+    this->compute_mapping_support_points(cell);
 
-  (void)cell;
-  (void)p;
+  const double       eps        = 1.e-12 * cell->diameter();
+  const unsigned int loop_limit = 10;
 
-  return {};
+  Point<dim> p_unit;
+
+  unsigned int loop = 0;
+
+  // This loop solves the following problem:
+  // grad_F^T residual + (grad_F^T grad_F + grad_F^T hess_F^T dp) dp = 0
+  // where the term
+  // (grad_F^T hess_F dp) is approximated by (-hess_F * residual)
+  // This is basically a second order approximation of Newton method, where the
+  // Jacobian is corrected with a higher order term coming from the hessian.
+  do
+    {
+      Point<spacedim> mapped_point;
+
+      // Transpose of the gradient map
+      DerivativeForm<1, spacedim, dim> grad_FT;
+      DerivativeForm<2, spacedim, dim> hess_FT;
+
+      for (unsigned int i = 0; i < this->fe->n_dofs_per_cell(); ++i)
+        {
+          mapped_point += support_points[i] * this->fe->shape_value(i, p_unit);
+          const auto grad_F_i    = this->fe->shape_grad(i, p_unit);
+          const auto hessian_F_i = this->fe->shape_grad_grad(i, p_unit);
+          for (unsigned int j = 0; j < dim; ++j)
+            {
+              grad_FT[j] += grad_F_i[j] * support_points[i];
+              for (unsigned int l = 0; l < dim; ++l)
+                hess_FT[j][l] += hessian_F_i[j][l] * support_points[i];
+            }
+        }
+
+      // Residual
+      const auto residual = p - mapped_point;
+      // Project the residual on the reference coordinate system
+      // to compute the error, and to filter components orthogonal to the
+      // manifold, and compute a 2nd order correction of the metric tensor
+      const auto grad_FT_residual = apply_transformation(grad_FT, residual);
+
+      // Do not invert nor compute the metric if not necessary.
+      if (grad_FT_residual.norm() <= eps)
+        break;
+
+      // Now compute the (corrected) metric tensor
+      Tensor<2, dim> corrected_metric_tensor;
+      for (unsigned int j = 0; j < dim; ++j)
+        for (unsigned int l = 0; l < dim; ++l)
+          corrected_metric_tensor[j][l] =
+            -grad_FT[j] * grad_FT[l] + hess_FT[j][l] * residual;
+
+      // And compute the update
+      const auto g_inverse = invert(corrected_metric_tensor);
+      p_unit -= Point<dim>(g_inverse * grad_FT_residual);
+
+      ++loop;
+    }
+  while (loop < loop_limit);
+
+  // Here we check that in the last execution of while the first
+  // condition was already wrong, meaning the residual was below
+  // eps. Only if the first condition failed, loop will have been
+  // increased and tested, and thus have reached the limit.
+  AssertThrow(loop < loop_limit,
+              (typename Mapping<dim, spacedim>::ExcTransformationFailed()));
+
+  return p_unit;
 }
 
 
@@ -1250,11 +1336,12 @@ namespace internal
     namespace
     {
       /**
-       * Depending on what information is called for in the update flags of the
+       * Depending on what information is called for in the update flags of
+       * the
        * @p data object, compute the various pieces of information that is
        * required by the fill_fe_face_values() and fill_fe_subface_values()
-       * functions. This function simply unifies the work that would be done by
-       * those two functions.
+       * functions. This function simply unifies the work that would be done
+       * by those two functions.
        *
        * The resulting data is put into the @p output_data argument.
        */
@@ -1292,9 +1379,9 @@ namespace internal
             // first compute some common data that is used for evaluating
             // all of the flags below
 
-            // map the unit tangentials to the real cell. checking for d!=dim-1
-            // eliminates compiler warnings regarding unsigned int expressions <
-            // 0.
+            // map the unit tangentials to the real cell. checking for
+            // d!=dim-1 eliminates compiler warnings regarding unsigned int
+            // expressions < 0.
             for (unsigned int d = 0; d != dim - 1; ++d)
               {
                 Assert(face_no + cell->n_faces() * d <
@@ -1315,8 +1402,9 @@ namespace internal
 
             if (update_flags & update_boundary_forms)
               {
-                // if dim==spacedim, we can use the unit tangentials to compute
-                // the boundary form by simply taking the cross product
+                // if dim==spacedim, we can use the unit tangentials to
+                // compute the boundary form by simply taking the cross
+                // product
                 if (dim == spacedim)
                   {
                     for (unsigned int i = 0; i < n_q_points; ++i)
@@ -1326,8 +1414,8 @@ namespace internal
                             // in 1d, we don't have access to any of the
                             // data.aux fields (because it has only dim-1
                             // components), but we can still compute the
-                            // boundary form by simply looking at the number of
-                            // the face
+                            // boundary form by simply looking at the number
+                            // of the face
                             output_data.boundary_forms[i][0] =
                               (face_no == 0 ? -1 : +1);
                             break;
@@ -1345,9 +1433,9 @@ namespace internal
                   }
                 else //(dim < spacedim)
                   {
-                    // in the codim-one case, the boundary form results from the
-                    // cross product of all the face tangential vectors and the
-                    // cell normal vector
+                    // in the codim-one case, the boundary form results from
+                    // the cross product of all the face tangential vectors
+                    // and the cell normal vector
                     //
                     // to compute the cell normal, use the same method used in
                     // fill_fe_values for cells above
@@ -1519,8 +1607,8 @@ MappingFE<dim, spacedim>::fill_fe_face_values(
 
   // if necessary, recompute the support points of the transformation of this
   // cell (note that we need to first check the triangulation pointer, since
-  // otherwise the second test might trigger an exception if the triangulations
-  // are not the same)
+  // otherwise the second test might trigger an exception if the
+  // triangulations are not the same)
   if ((data.mapping_support_points.size() == 0) ||
       (&cell->get_triangulation() !=
        &data.cell_of_current_support_points->get_triangulation()) ||
@@ -1566,8 +1654,8 @@ MappingFE<dim, spacedim>::fill_fe_subface_values(
 
   // if necessary, recompute the support points of the transformation of this
   // cell (note that we need to first check the triangulation pointer, since
-  // otherwise the second test might trigger an exception if the triangulations
-  // are not the same)
+  // otherwise the second test might trigger an exception if the
+  // triangulations are not the same)
   if ((data.mapping_support_points.size() == 0) ||
       (&cell->get_triangulation() !=
        &data.cell_of_current_support_points->get_triangulation()) ||
@@ -2136,23 +2224,88 @@ MappingFE<dim, spacedim>::transform(
 
 
 
+namespace
+{
+  template <int spacedim>
+  bool
+  check_all_manifold_ids_identical(
+    const TriaIterator<CellAccessor<1, spacedim>> &)
+  {
+    return true;
+  }
+
+
+
+  template <int spacedim>
+  bool
+  check_all_manifold_ids_identical(
+    const TriaIterator<CellAccessor<2, spacedim>> &cell)
+  {
+    const auto b_id = cell->manifold_id();
+
+    for (const auto f : cell->face_indices())
+      if (b_id != cell->face(f)->manifold_id())
+        return false;
+
+    return true;
+  }
+
+
+
+  template <int spacedim>
+  bool
+  check_all_manifold_ids_identical(
+    const TriaIterator<CellAccessor<3, spacedim>> &cell)
+  {
+    const auto b_id = cell->manifold_id();
+
+    for (const auto f : cell->face_indices())
+      if (b_id != cell->face(f)->manifold_id())
+        return false;
+
+    for (const auto l : cell->line_indices())
+      if (b_id != cell->line(l)->manifold_id())
+        return false;
+
+    return true;
+  }
+} // namespace
+
+
+
 template <int dim, int spacedim>
 std::vector<Point<spacedim>>
 MappingFE<dim, spacedim>::compute_mapping_support_points(
   const typename Triangulation<dim, spacedim>::cell_iterator &cell) const
 {
-  // get the vertices first
-  std::vector<Point<spacedim>> a(cell->n_vertices());
+  Assert(
+    check_all_manifold_ids_identical(cell),
+    ExcMessage(
+      "All entities of a cell need to have the same boundary id as the cell has."));
+
+  std::vector<Point<spacedim>> vertices(cell->n_vertices());
 
   for (const unsigned int i : cell->vertex_indices())
-    a[i] = cell->vertex(i);
+    vertices[i] = cell->vertex(i);
 
-  if (this->polynomial_degree > 1)
-    {
-      Assert(false, ExcNotImplemented());
-    }
+  std::vector<Point<spacedim>> mapping_support_points(
+    fe->get_unit_support_points().size());
 
-  return a;
+  cell->get_manifold().get_new_points(vertices,
+                                      mapping_support_point_weights,
+                                      mapping_support_points);
+
+  return mapping_support_points;
+}
+
+
+
+template <int dim, int spacedim>
+BoundingBox<spacedim>
+MappingFE<dim, spacedim>::get_bounding_box(
+  const typename Triangulation<dim, spacedim>::cell_iterator &cell) const
+{
+  return BoundingBox<spacedim>(this->compute_mapping_support_points(cell));
 }
 
 
